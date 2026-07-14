@@ -1,0 +1,12 @@
+{:itonami.blueprint/id "cloud-itonami-0141"
+ :itonami.blueprint/name "Cattle-Raising Operations Coordination"
+ :itonami.blueprint/isic-rev5 "0141"
+ :itonami.blueprint/domain :agriculture/cattle-raising
+ :itonami.blueprint/license "AGPL-3.0-or-later"
+ :itonami.blueprint/social-impact [:animal-welfare :food-security :rural-employment]
+ :itonami.blueprint/governor :ranching-operations-governor
+ :itonami.blueprint/robotics true
+ :itonami.blueprint/required-technologies [:robotics :identity :forms :audit-ledger]
+ :itonami.blueprint/optional-technologies [:telemetry :optimization :dmn :bpmn]
+ :itonami.blueprint/status :public-oss
+ :itonami.blueprint/maturity :implemented}

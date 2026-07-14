@@ -33,20 +33,18 @@ decisions about animal welfare, treatment, and economic choices. The robot
    {:facility-id "farm-001"
     :op :log-herd-record
     :count 50
-    :health-status "healthy"
-    :confidence 0.95}
+    :health-status "healthy"}
    ```
 
-2. **Actor Processes**
-   - `:intake` — receives request
-   - `:advise` — advisor generates proposal
-   - `:govern` — governor checks hard invariants
-   - `:decide` — decision: commit / escalate / hold
+2. **Actor Processes** (`operation/run-operation store request context`)
+   - `:advise` — `CattleOpsAdvisor` proposes an action (`cattleops.advisor`)
+   - `:govern` — `RanchingOperationsGovernor` checks hard invariants and escalation gates (`cattleops.governor`)
+   - phase gate — rollout-phase constraints applied on top of the Governor's verdict (`cattleops.phase`)
 
-3. **Outcomes**
-   - **:commit** — operation logged, robot proceeds
-   - **:request-approval** — operation escalated, awaits human decision
-   - **:hold** — operation blocked (hard violation)
+3. **Outcomes** (`:disposition` on the return value)
+   - **`:commit`** — operation logged, robot proceeds (`:record` is present)
+   - **`:escalate`** — operation held pending human decision (audit fact `:t :approval-requested`)
+   - **`:hold`** — operation blocked, hard violation (audit fact `:t :governor-hold`, cites `:violations`)
 
 ### Escalation Scenarios
 
@@ -62,37 +60,42 @@ decisions about animal welfare, treatment, and economic choices. The robot
 
 ### Resuming Escalated Operations
 
-After human review/approval:
-
-```clojure
-(actor/approve! graph thread-id)
-```
-
-The operation proceeds from the `:request-approval` node directly to `:commit`.
+`cattleops.operation` is currently a synchronous stub (see its docstring):
+one call to `(operation/run-operation store request context)` runs the full
+`advise -> govern -> phase-gate` flow and returns immediately with a
+`:disposition` of `:commit`, `:escalate`, or `:hold`. There is **no
+persisted pause/resume yet** — that requires the deferred `langgraph-clj`
+StateGraph integration (`interrupt-before` + checkpoint-based resume,
+mirroring `cloud-itonami-isic-1010`). Until then, an `:escalate`
+disposition means: **do not commit** — the caller (production
+integration layer) is responsible for holding the proposal for human
+review and re-submitting a follow-up operation once approved.
 
 ## Audit & Transparency
 
-All operations are logged in an append-only ledger. You can:
+Every operation run returns an `:audit` vector containing an
+advisor-proposal trace and a disposition fact (`:committed`,
+`:governor-hold`, or `:approval-requested`). Production integration is
+responsible for appending these facts to an append-only ledger (the
+reference implementation does not include a ledger-writer — that's a
+backend-integration concern, same seam point as the `Store`).
 
-- Review the ledger at any time
-- Verify each decision (approve/escalate/block)
-- Trace all animal health concerns
-- Audit all supply orders
-
-The ledger is **never edited or deleted** — it's a permanent record of all
-operations and decisions.
+- Every proposal produces a trace, regardless of outcome
+- Every hold cites the specific Governor rule(s) violated (`:violations`)
+- Every escalation cites its `:reason` (always-escalate op / high cost / low confidence)
 
 ## Integration
 
 The actor provides a standard protocol (`cattleops.store/Store`) for backend
 integration:
 
-- **Facility lookup** — `(store/facility store facility-id)`
-- **Record commit** — `(store/commit-record! store record)`
-- **Ledger append** — `(store/append-ledger! store entry)`
-- **Ledger read** — `(store/ledger store)`
+- **Facility lookup** — `(store/registered-facility store facility-id)`
 
-Implementations include in-memory (testing), database, cloud storage, etc.
+Implementations include in-memory `MemStore` (testing, `cattleops.store`),
+and future Datomic/kotoba-server backends (the same seam point all
+cloud-itonami actors use). Record-commit and ledger-append are integration
+responsibilities on top of `operation/run-operation`'s return value, not
+part of the `Store` protocol itself.
 
 ## Safety Guarantees
 
