@@ -1,4 +1,4 @@
-{:itonami.blueprint/id "cloud-itonami-0141"
+{:itonami.blueprint/id "cloud-itonami-isic-0141"
  :itonami.blueprint/name "Cattle-Raising Operations Coordination"
  :itonami.blueprint/isic-rev5 "0141"
  :itonami.blueprint/domain :agriculture/cattle-raising
@@ -9,4 +9,4 @@
  :itonami.blueprint/required-technologies [:robotics :identity :forms :audit-ledger]
  :itonami.blueprint/optional-technologies [:telemetry :optimization :dmn :bpmn]
  :itonami.blueprint/status :public-oss
- :itonami.blueprint/maturity :implemented}
+ :itonami.blueprint/maturity :blueprint}
