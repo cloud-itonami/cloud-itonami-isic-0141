@@ -1,0 +1,803 @@
+(ns cattleops.render-html
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+
+  Closes flagship checklist item 2 for this repo: before this namespace
+  existed there was NO demo page and no generator at all (`docs/` held
+  only prose + a product `index.html`). Everything the console shows is
+  produced by driving the REAL actor stack at build time --
+  `cattleops.operation/build` -> `cattleops.advisor` -> the independent
+  `cattleops.governor` -> `cattleops.phase` gate -> the disposition and
+  audit facts that flow back out. Nothing on the page is hand-authored
+  domain content.
+
+  This repo has no langgraph StateGraph: `cattleops.operation/build`
+  returns a plain invoke function (`operation.cljc` documents the
+  StateGraph wiring as deferred), so the actor entry point IS
+  `(operation/build store opts)` and that is what is called here.
+
+  Likewise this repo's `cattleops.store` is READ-ONLY -- its protocol
+  has a single method, `registered-facility`. There is no commit /
+  approve / resume entry point anywhere in the repo, so there is no
+  ledger inside the store to read back: the audit ledger rendered here
+  is the ordered concatenation of the `:audit` vectors the real runs
+  returned. The approver-attribution section measures that store shape
+  at render time rather than asserting it (see `approval-measurement`)
+  -- if a write path is added later the page re-derives itself instead
+  of keeping a stale claim.
+
+  Provenance of every literal in `scenarios` below (the console must not
+  assert anything this repo's own data does not contain):
+    - facility ids/names   `farm-001`/\"Test Ranch\" from `cattleops.sim`,
+                           `farm-002`/\"New Ranch\" from
+                           `test/cattleops/store_test.cljc`
+    - species ids          `cattle`/`buffalo` from `cattleops.facts/species`
+    - supply categories    `feed`/`equipment` and the 500/1000 thresholds
+                           from `cattleops.facts/supply-categories`
+    - costs                100 / 500 / 800 / 1000 / 1200 -- all from
+                           `test/cattleops/governor_test.cljc` or the
+                           thresholds themselves (500 is the exact
+                           boundary; `registry/cost-exceeds-threshold?`
+                           is inclusive there)
+    - herd counts          50 and 0 from `governor_test`/`sim`
+    - confidences          0.5 from `governor_test`, 0.7 = the literal
+                           `governor/confidence-floor`
+    - concern text         \"疾病の可能性\" from `governor_test`
+    - ops                  `:dispatch-robot-arm` (the unknown-op probe)
+                           from `governor_test`
+  Three values are deliberate probes with no seed counterpart and are
+  labelled as such on the page: `farm-003` (an id absent from the
+  store), a negative herd count, and `:phase-unknown` (the phase gate's
+  conservative default branch).
+
+  Determinism: no timestamps, no random ids, no map-iteration order --
+  scenarios are an ordered vector and every fold over a set/map sorts
+  first. Two runs are byte-identical.
+
+  Usage: `clojure -M:dev:render-html [out-file]`
+  (default `docs/samples/operator-console.html`)."
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
+            [jp-go-dds.skin]
+            [cattleops.advisor :as advisor]
+            [cattleops.facts :as facts]
+            [cattleops.governor :as governor]
+            [cattleops.operation :as operation]
+            [cattleops.phase :as phase]
+            [cattleops.store :as store]))
+
+;; ------------------------------ seed ------------------------------
+
+(def ^:private seed-facilities
+  "Facility records seeded into the real `cattleops.store/mem-store`.
+  `farm-001` is `cattleops.sim/demo`'s facility verbatim; `farm-002` is
+  `store_test`'s id+name, given a species drawn from
+  `cattleops.facts/species`. The Store docstring states facility data is
+  opaque to it, so these are the whole record."
+  {"farm-001" {:id "farm-001" :name "Test Ranch" :species "cattle"}
+   "farm-002" {:id "farm-002" :name "New Ranch"  :species "buffalo"}})
+
+(def ^:private unregistered-facility-id
+  "An id deliberately NOT seeded, to exercise the Governor's
+  `:facility-not-registered` hard rule. The console proves it is absent
+  by calling `store/registered-facility` rather than asserting it."
+  "farm-003")
+
+(def ^:private operator-context
+  {:actor-id "cattle-ops-01" :role :ranch-operator})
+
+;; ---------------------------- advisors ----------------------------
+
+(defrecord OverrideAdvisor [base overrides]
+  advisor/Advisor
+  (-advise [_this st request]
+    (merge (advisor/-advise base st request) overrides)))
+
+(defn- advisor-for
+  "The stock `mock-advisor`, or -- when a scenario needs to show the
+  Governor rejecting a MISBEHAVING advisor -- the same advisor with its
+  proposal overridden. The advisor is an injected seam
+  (`operation/run-operation`'s `:advisor` opt), so this is the supported
+  way to prove the Governor does not trust its advisor."
+  [overrides]
+  (let [mock (advisor/mock-advisor)]
+    (if (seq overrides) (->OverrideAdvisor mock overrides) mock)))
+
+;; ---------------------------- scenarios ----------------------------
+
+(def ^:private scenarios
+  "Ordered scenario table. Each entry is fed to the real actor; nothing
+  here records an expected outcome -- the disposition rendered on the
+  page is whatever the Governor and phase gate actually returned."
+  [{:id "S01" :phase :phase-2
+    :intent "登録済み施設への通常の頭数記録"
+    :request {:op :log-herd-record :facility-id "farm-001" :count 50
+              :health-status "healthy"}}
+   {:id "S02" :phase :phase-2
+    :intent "登録済み施設への往診スケジュール"
+    :request {:op :schedule-veterinary-visit :facility-id "farm-001"
+              :reason "routine-check"}}
+   {:id "S03" :phase :phase-3
+    :intent "しきい値内の飼料発注 (100 <= 500)"
+    :request {:op :order-supplies :facility-id "farm-001" :category "feed"
+              :cost 100}}
+   {:id "S04" :phase :phase-3
+    :intent "しきい値ちょうどの飼料発注 (500、境界は包含)"
+    :request {:op :order-supplies :facility-id "farm-001" :category "feed"
+              :cost 500}}
+   {:id "S05" :phase :phase-3
+    :intent "設備発注、カテゴリ別しきい値内 (800 <= 1000)"
+    :request {:op :order-supplies :facility-id "farm-002" :category "equipment"
+              :cost 800}}
+   {:id "S06" :phase :phase-3
+    :intent "確信度がフロアちょうど (0.7、境界は通過)"
+    :overrides {:confidence 0.7}
+    :request {:op :log-herd-record :facility-id "farm-002" :count 50
+              :health-status "healthy"}}
+   ;; --- escalations -------------------------------------------------
+   {:id "S07" :phase :phase-3
+    :intent "動物の健康懸念のフラグ -- 常に人間へ"
+    :request {:op :flag-animal-health-concern :facility-id "farm-001"
+              :concern "疾病の可能性"}}
+   {:id "S08" :phase :phase-1
+    :intent "同上を phase-1 で -- phase ゲート側でも常時エスカレート"
+    :request {:op :flag-animal-health-concern :facility-id "farm-002"
+              :concern "疾病の可能性"}}
+   {:id "S09" :phase :phase-2
+    :intent "既定しきい値超過の飼料発注 (1000 > 500)"
+    :request {:op :order-supplies :facility-id "farm-001" :category "feed"
+              :cost 1000}}
+   {:id "S10" :phase :phase-2
+    :intent "カテゴリ別しきい値超過の設備発注 (1200 > 1000)"
+    :request {:op :order-supplies :facility-id "farm-002" :category "equipment"
+              :cost 1200}}
+   {:id "S11" :phase :phase-2
+    :intent "確信度フロア未満 (0.5 < 0.7)"
+    :overrides {:confidence 0.5}
+    :request {:op :log-herd-record :facility-id "farm-001" :count 50
+              :health-status "healthy"}}
+   {:id "S12" :phase :phase-0
+    :intent "phase-0 では Governor が clean でも自律コミットしない"
+    :request {:op :log-herd-record :facility-id "farm-001" :count 50
+              :health-status "healthy"}}
+   ;; --- hard holds --------------------------------------------------
+   {:id "S13" :phase :phase-2
+    :intent "未登録施設 (probe: farm-003 は seed に無い)"
+    :request {:op :log-herd-record :facility-id unregistered-facility-id
+              :count 50 :health-status "healthy"}}
+   {:id "S14" :phase :phase-2
+    :intent "facility-id 自体が無い要求"
+    :request {:op :log-herd-record :count 50 :health-status "healthy"}}
+   {:id "S15" :phase :phase-2
+    :intent "暴走 advisor が :effect :execute を提案 -- 直接実行は恒久禁止"
+    :overrides {:effect :execute}
+    :request {:op :log-herd-record :facility-id "farm-001" :count 50
+              :health-status "healthy"}}
+   {:id "S16" :phase :phase-2
+    :intent "直接治療の実施 -- 獣医の専権事項"
+    :request {:op :administer-treatment :facility-id "farm-001"}}
+   {:id "S17" :phase :phase-2
+    :intent "と畜/淘汰の判断 -- 牧場主の専権事項"
+    :request {:op :order-slaughter :facility-id "farm-001"}}
+   {:id "S18" :phase :phase-2
+    :intent "allowlist 外の操作 (governor_test の :dispatch-robot-arm)"
+    :request {:op :dispatch-robot-arm :facility-id "farm-001"}}
+   {:id "S19" :phase :phase-2
+    :intent "頭数 0 の記録提案"
+    :request {:op :log-herd-record :facility-id "farm-001" :count 0
+              :health-status "healthy"}}
+   {:id "S20" :phase :phase-2
+    :intent "頭数が負の記録提案 (probe)"
+    :request {:op :log-herd-record :facility-id "farm-001" :count -5
+              :health-status "healthy"}}
+   {:id "S21" :phase :phase-2
+    :intent "未登録施設への と畜提案 -- 違反は 1 件に丸めず両方積む"
+    :request {:op :order-slaughter :facility-id unregistered-facility-id}}
+   {:id "S22" :phase :phase-unknown
+    :intent "未知の phase (probe) -- phase ゲートは保守的に hold"
+    :request {:op :log-herd-record :facility-id "farm-001" :count 50
+              :health-status "healthy"}}])
+
+(def ^:private phase-matrix-ops
+  "Two ops run across every phase so the rollout gate is shown as a
+  measured matrix, not a described one."
+  [{:op :log-herd-record :facility-id "farm-001" :count 50
+    :health-status "healthy"}
+   {:op :flag-animal-health-concern :facility-id "farm-001"
+    :concern "疾病の可能性"}])
+
+(def ^:private phase-matrix-phases
+  [:phase-0 :phase-1 :phase-2 :phase-3 :phase-unknown])
+
+;; ------------------------------ run -------------------------------
+
+(defn- invoke!
+  "One real actor run. `operation/build` is this repo's actor entry
+  point (the StateGraph wiring is documented as deferred in
+  `operation.cljc`)."
+  [st request phase overrides]
+  (let [actor (operation/build st {:advisor (advisor-for overrides)})]
+    (actor request (assoc operator-context :phase phase))))
+
+(defn run-demo!
+  "Drives every scenario and the phase matrix through the real actor
+  against one freshly seeded store. Returns
+  {:store :runs :matrix :ledger} where `:ledger` is the ordered
+  concatenation of every `:audit` vector the runs produced -- this repo
+  has no in-store ledger to read back (see ns docstring)."
+  []
+  (let [st (store/mem-store {:initial-facilities seed-facilities})
+        runs (mapv (fn [{:keys [request phase overrides] :as sc}]
+                     (assoc sc :result (invoke! st request phase overrides)))
+                   scenarios)
+        matrix (vec (for [request phase-matrix-ops
+                          phase phase-matrix-phases]
+                      {:request request :phase phase
+                       :result (invoke! st request phase nil)}))]
+    {:store st
+     :runs runs
+     :matrix matrix
+     :ledger (vec (mapcat (comp :audit :result) (concat runs matrix)))}))
+
+;; --------------------------- derivations ---------------------------
+
+(def ^:private approver-keys
+  "Key names an approver identity could plausibly land under. Checked at
+  every level of a commit record rather than assumed."
+  #{:approved-by :approver :approved_by :signed-off-by :decided-by})
+
+(defn- approver-in? [m]
+  (boolean (and (map? m) (some #(contains? m %) approver-keys))))
+
+(defn- record-has-approver? [record]
+  (or (approver-in? record)
+      (approver-in? (:value record))
+      (approver-in? (:payload record))))
+
+(defn- store-protocol-methods []
+  (->> (:sigs store/Store) vals (map (comp name :name)) sort vec))
+
+(defn approval-measurement
+  "MEASURES this repo's approval/approver plumbing instead of asserting
+  it. Everything here is read off the live protocol and the records the
+  real runs produced, so the disclosure the page prints re-derives
+  itself the day a write path is added."
+  [{:keys [runs matrix ledger]}]
+  (let [all (concat runs matrix)
+        records (keep (comp :record :result) all)
+        write-methods (remove #{"registered-facility"} (store-protocol-methods))]
+    {:store-methods        (store-protocol-methods)
+     :write-methods        (vec write-methods)
+     :commit-records       (count records)
+     :records-with-payload (count (filter #(contains? % :payload) records))
+     :records-with-value   (count (filter #(contains? % :value) records))
+     :records-with-approver (count (filter record-has-approver? records))
+     :escalations          (count (filter #(= :approval-requested (:t %)) ledger))
+     :approval-facts       (count (filter #(contains? #{:approval-granted :approval-denied}
+                                                      (:t %))
+                                          ledger))
+     :facts-with-approver  (count (filter approver-in? ledger))}))
+
+(defn- disposition-of [run] (get-in run [:result :disposition]))
+
+(defn- hold-fact-of [run]
+  (first (filter #(= :governor-hold (:t %)) (get-in run [:result :audit]))))
+
+(defn- fired-rules
+  "The set of Governor hard-rule keywords that actually fired."
+  [{:keys [runs matrix]}]
+  (into (sorted-set)
+        (mapcat (fn [r] (map :rule (get-in r [:result :verdict :violations])))
+                (concat runs matrix))))
+
+(defn- op-class [op]
+  (cond
+    (contains? governor/blocked-ops op)          :permanently-blocked
+    (contains? governor/always-escalate-ops op)  :always-escalates
+    (contains? governor/known-ops op)            :allowlisted
+    :else                                        :unknown-op))
+
+(defn- facility-ids-seen [runs]
+  (->> runs
+       (map (comp :facility-id :request))
+       distinct
+       (sort-by #(or % ""))
+       vec))
+
+;; ---------------------------- html utils ----------------------------
+
+(defn- esc [v]
+  (-> (str v)
+      (str/replace "&" "&amp;")
+      (str/replace "<" "&lt;")
+      (str/replace ">" "&gt;")
+      (str/replace "\"" "&quot;")))
+
+(defn- code [v] (str "<code>" (esc v) "</code>"))
+(defn- span [cls v] (str "<span class=\"" cls "\">" (esc v) "</span>"))
+(defn- muted [v] (span "muted" v))
+(defn- nm [v] (if (keyword? v) (name v) (str v)))
+
+(defn- disposition-cell [d]
+  (case d
+    :commit   (span "ok" "commit")
+    :escalate (span "warn" "escalate")
+    :hold     (span "critical" "HOLD")
+    (muted (nm d))))
+
+(defn- kv-str
+  "Deterministic rendering of a record/value map: nils dropped, keys
+  sorted by name."
+  [m]
+  (if (seq m)
+    (->> m
+         (remove (comp nil? val))
+         (sort-by (comp name key))
+         (map (fn [[k v]] (str (name k) "=" (nm v))))
+         (str/join ", "))
+    ""))
+
+(defn- row [cells]
+  (str "        <tr>" (str/join (map #(str "<td>" % "</td>") cells)) "</tr>"))
+
+(defn- section [{:keys [title lead headers rows]}]
+  (str "  <section class=\"card\">\n"
+       "    <h2>" (esc title) "</h2>\n"
+       "    <p class=\"muted\">" lead "</p>\n"
+       "    <table>\n"
+       "      <thead><tr>" (str/join (map #(str "<th>" (esc %) "</th>") headers))
+       "</tr></thead>\n"
+       "      <tbody>\n"
+       (str/join "\n" (map row rows)) "\n"
+       "      </tbody>\n"
+       "    </table>\n"
+       "  </section>\n"))
+
+;; ----------------------------- sections -----------------------------
+
+(defn- facilities-section [{:keys [store runs]}]
+  (let [ids (facility-ids-seen runs)]
+    {:title "施設レジストリ (Facility registry)"
+     :lead (str "登録状態の列は "
+                (code "cattleops.store/registered-facility")
+                " を実際に呼んだ結果。未登録の id は Governor の "
+                (code ":facility-not-registered")
+                " ハード違反を踏むための probe で、seed には存在しない。")
+     :headers ["facility-id" "名称" "species" "登録状態" "この実行での操作数"
+               "commit" "escalate" "HOLD"]
+     :rows (for [id ids
+                 :let [f (store/registered-facility store id)
+                       sp (facts/species-by-id (:species f))
+                       mine (filter #(= id (get-in % [:request :facility-id])) runs)
+                       cnt (fn [d] (count (filter #(= d (disposition-of %)) mine)))]]
+             [(if id (code id) (muted "(facility-id 無し)"))
+              (if f (esc (:name f)) (muted "—"))
+              (if sp (str (esc (:name sp)) " " (code (:id sp))) (muted "—"))
+              (if f (span "ok" "登録済み") (span "critical" "未登録 (store が nil を返す)"))
+              (esc (count mine))
+              (esc (cnt :commit))
+              (esc (cnt :escalate))
+              (esc (cnt :hold))])}))
+
+(defn- op-gate-section [{:keys [runs matrix]}]
+  (let [all (concat runs matrix)
+        seen-ops (map (comp :op :request) all)
+        known (sort-by name governor/all-recognized-ops)
+        extra (sort-by name (remove #(contains? governor/all-recognized-ops %)
+                                    (distinct seen-ops)))
+        ops (concat known extra)]
+    {:title "操作ゲート (Ranching Operations Governor)"
+     :lead (str "行は "
+                (code "cattleops.governor")
+                " の "
+                (code "known-ops")
+                " / "
+                (code "blocked-ops")
+                " / "
+                (code "always-escalate-ops")
+                " を実行時に読んで生成しており、手書きの表ではない。"
+                "ハード違反は上書き不可 — 確信度がいくら高くても通らない。")
+     :headers ["op" "分類" "この実行での回数" "commit" "escalate" "HOLD"]
+     :rows (for [op ops
+                 :let [mine (filter #(= op (get-in % [:request :op])) all)
+                       cnt (fn [d] (count (filter #(= d (disposition-of %)) mine)))]]
+             [(code op)
+              (case (op-class op)
+                :permanently-blocked (span "critical" "恒久ブロック (blocked-ops)")
+                :always-escalates    (span "warn" "常時エスカレート (always-escalate-ops)")
+                :allowlisted         (span "ok" "allowlist 内 (known-ops)")
+                (span "critical" "allowlist 外 (未知 op)"))
+              (esc (count mine))
+              (esc (cnt :commit))
+              (esc (cnt :escalate))
+              (esc (cnt :hold))])}))
+
+(defn- cost-threshold-section [{:keys [runs]}]
+  (let [orders (filter #(= :order-supplies (get-in % [:request :op])) runs)
+        cat-of (fn [r] (get-in r [:request :category]))]
+    {:title "調達カテゴリとエスカレーションしきい値"
+     :lead (str "しきい値は "
+                (code "cattleops.facts/supply-categories")
+                " から読み出したもの。判定は "
+                (code "cattleops.registry/cost-exceeds-threshold?")
+                " で、境界は包含 (しきい値ちょうどはエスカレートしない)。")
+     :headers ["category" "名称" "しきい値" "この実行での発注" "金額" "結果"]
+     :rows (concat
+            (for [cid (sort (keys facts/supply-categories))
+                  :let [c (facts/supply-category-by-id cid)
+                        mine (filter #(= cid (cat-of %)) orders)]]
+              [(code cid)
+               (esc (:name c))
+               (esc (:cost-threshold c))
+               (esc (count mine))
+               (if (seq mine)
+                 (esc (str/join ", " (map #(get-in % [:request :cost]) mine)))
+                 (muted "—"))
+               (if (seq mine)
+                 (str/join " " (map #(disposition-cell (disposition-of %)) mine))
+                 (muted "—"))])
+            [[(code "(未知カテゴリ)")
+              (muted "既定フォールバック")
+              (esc facts/default-cost-threshold)
+              (esc (count (remove #(facts/supply-category-by-id (cat-of %)) orders)))
+              (muted "—")
+              (muted "—")]])}))
+
+(defn- species-section [{:keys [store runs]}]
+  (let [ids (facility-ids-seen runs)
+        facs (keep #(store/registered-facility store %) ids)]
+    {:title "種別リファレンス (ISIC 0141)"
+     :lead (str "ISIC 0141 が対象とする種別。"
+                (code "cattleops.facts/species")
+                " から読み出し、登録済み施設の実データと突き合わせている。")
+     :headers ["species-id" "名称" "この実行の登録施設"]
+     :rows (for [sid (sort (keys facts/species))
+                 :let [s (facts/species-by-id sid)
+                       matching (sort (map :id (filter #(= sid (:species %)) facs)))]]
+             [(code sid)
+              (esc (:name s))
+              (if (seq matching)
+                (str/join ", " (map code matching))
+                (muted "—"))])}))
+
+(defn- basis-cell [run]
+  (let [{:keys [audit]} (:result run)
+        fact (second audit)
+        basis (:basis fact)]
+    (cond
+      (= :governor-hold (:t fact))
+      (let [rules (seq (remove nil? basis))]
+        (if rules
+          (str/join ", " (map code rules))
+          (str (span "critical" (str "phase ゲート: " (nm (:phase-reason fact))))
+               " " (muted "(Governor 違反なし)"))))
+
+      (= :approval-requested (:t fact))
+      (code (:reason fact))
+
+      (= :committed (:t fact))
+      (if (seq basis) (esc (str/join ", " basis)) (muted "—"))
+
+      :else (muted "—"))))
+
+(defn- scenario-section [{:keys [runs]}]
+  {:title "シナリオ台帳 (実行結果)"
+   :lead (str "各行は "
+              (code "cattleops.operation/build")
+              " で組んだ実アクターを 1 回まわした結果。"
+              "disposition・根拠・コミット記録はすべて実行の戻り値であり、"
+              "期待値を書いたものではない。")
+   :headers ["#" "op" "施設" "phase" "確信度" "disposition" "根拠 / 理由" "コミット記録"]
+   :rows (for [{:keys [id phase request result intent] :as run} runs
+               :let [conf (get-in result [:verdict :confidence])]]
+           [(str (esc id) "<br>" (muted intent))
+            (code (:op request))
+            (if (:facility-id request) (code (:facility-id request)) (muted "—"))
+            (code phase)
+            (if (and conf (< conf governor/confidence-floor))
+              (span "warn" conf)
+              (esc conf))
+            (disposition-cell (disposition-of run))
+            (basis-cell run)
+            (if-let [r (:record result)]
+              (code (kv-str (:value r)))
+              (muted "—"))])})
+
+(defn- hard-hold-section [{:keys [runs matrix]}]
+  (let [all (concat runs matrix)
+        held (filter #(= :hold (disposition-of %)) all)
+        rows (mapcat
+              (fn [run]
+                (let [fact (hold-fact-of run)
+                      vs (get-in run [:result :verdict :violations])
+                      label (or (:id run) (str (nm (get-in run [:request :op]))
+                                               " @ " (nm (:phase run))))]
+                  (if (seq vs)
+                    (for [v vs]
+                      [(esc label)
+                       (span "critical" (nm (:rule v)))
+                       (code (get-in run [:request :op]))
+                       (if-let [f (get-in run [:request :facility-id])] (code f) (muted "—"))
+                       (esc (:detail v))])
+                    [[(esc label)
+                      (span "critical" (str "phase-gate/" (nm (:phase-reason fact))))
+                      (code (get-in run [:request :op]))
+                      (if-let [f (get-in run [:request :facility-id])] (code f) (muted "—"))
+                      (esc (str "phase " (nm (:phase fact))
+                                " は既知の rollout phase ではない -- phase ゲートは保守的に hold する"))]])))
+              held)]
+    {:title "実際に発火したハード違反"
+     :lead (str "1 行 = 実行が返した違反 1 件。detail 文は "
+                (code "cattleops.governor")
+                " が生成した本文そのままで、ここで書き起こしたものではない。"
+                "HOLD は人間に到達しない — 承認で覆せない。")
+     :headers ["シナリオ" "rule" "op" "施設" "Governor の判定理由"]
+     :rows rows}))
+
+(defn- phase-matrix-section [{:keys [matrix]}]
+  {:title "Phase ゲート実測マトリクス"
+   :lead (str "同じ要求を phase を変えて実際に流した結果。既定 phase は "
+              (code phase/default-phase)
+              "。未知 phase は "
+              (code "cattleops.phase/gate")
+              " の保守的な default 分岐を踏むための probe。")
+   :headers ["op" "phase" "disposition" "理由"]
+   :rows (for [{:keys [request phase result]} matrix
+               :let [fact (second (:audit result))]]
+           [(code (:op request))
+            (code phase)
+            (disposition-cell (:disposition result))
+            (cond
+              (:phase-reason fact) (code (:phase-reason fact))
+              (:reason fact)       (code (:reason fact))
+              :else                (muted "—"))])})
+
+(defn- ledger-section [{:keys [ledger]}]
+  {:title "監査台帳 (このビルドの全事実)"
+   :lead (str "追記のみの決定事実ログ。"
+              (code ":advisor-proposal")
+              " は提案が採用されたかに関わらず必ず記録される — "
+              "提案そのものが監査対象だからである。")
+   :headers ["#" "fact" "op" "施設" "確信度" "根拠 / 概要"]
+   :rows (map-indexed
+          (fn [i {:keys [t op facility-id subject confidence basis
+                         proposal-summary summary reason disposition]}]
+            [(esc (inc i))
+             (case t
+               :advisor-proposal   (muted "advisor-proposal")
+               :committed          (span "ok" "committed")
+               :governor-hold      (span "critical" "governor-hold")
+               :approval-requested (span "warn" "approval-requested")
+               (esc (nm t)))
+             (code op)
+             (if-let [s (or facility-id subject)] (code s) (muted "—"))
+             (if confidence (esc confidence) (muted "—"))
+             (or (some-> proposal-summary esc)
+                 (some-> summary esc)
+                 (some->> (seq basis) (map code) (str/join ", "))
+                 (some-> reason code)
+                 (some-> disposition code)
+                 (muted "—"))])
+          ledger)})
+
+(defn- approval-section [state]
+  (let [m (approval-measurement state)
+        no-write? (empty? (:write-methods m))]
+    {:title "承認と承認者の帰属 (実測)"
+     :lead (str "この節は主張ではなく計測である。"
+                (code "(:sigs cattleops.store/Store)")
+                " と実行が返した commit 記録を render 時に走査して導出しており、"
+                "書き込み経路が追加されれば文面は自動的に変わる。")
+     :headers ["観測項目" "実測値"]
+     :rows [["Store プロトコルのメソッド"
+             (str/join ", " (map code (:store-methods m)))]
+            ["うち書き込み / 承認メソッド"
+             (if no-write?
+               (span "critical" "0 件 — このリポジトリの Store は読み取り専用")
+               (str/join ", " (map code (:write-methods m))))]
+            ["commit 記録の生成数" (esc (:commit-records m))]
+            [(str "うち " (code ":value") " を持つもの") (esc (:records-with-value m))]
+            [(str "うち " (code ":payload") " を持つもの")
+             (str (esc (:records-with-payload m)) " "
+                  (muted (str "(" "operation/commit-record は :value と :payload の両方を書く "
+                              "— 記録側で payload が落ちる欠陥ではない)")))]
+            ["うち承認者キーを持つもの"
+             (if (zero? (:records-with-approver m))
+               (span "warn" "0 件")
+               (span "ok" (:records-with-approver m)))]
+            ["エスカレーション (approval-requested)" (esc (:escalations m))]
+            ["承認/却下の事実 (approval-granted 等)"
+             (if (zero? (:approval-facts m))
+               (span "critical" "0 件")
+               (esc (:approval-facts m)))]
+            ["承認者を持つ監査事実" (esc (:facts-with-approver m))]
+            ["導出される結論"
+             (cond
+               (and no-write? (zero? (:approval-facts m)))
+               (str (span "critical" "承認経路が存在しない")
+                    " "
+                    (esc (str "この実行は " (:escalations m)
+                              " 件を人間へエスカレートしたが、Store には commit も approve も resume も無く、"
+                              "承認を書き戻す先が無い。したがって承認者は「記録が落ちた」のではなく「そもそも記録されない」。"
+                              "コンソールが承認者を伏せているのではなく、承認という事実がまだ存在しない。"))
+                    " "
+                    (esc "実装の穴であって、このページの省略ではない。"))
+
+               (and (pos? (:approval-facts m)) (zero? (:records-with-approver m)))
+               (span "warn" "承認は記録されているが commit 記録に承認者が残っていない — 監査事実側と突き合わせる必要がある")
+
+               :else
+               (span "ok" "承認者は commit 記録に保持されている"))]]}))
+
+;; ---------------------------- invariants ----------------------------
+
+(def ^:private required-hard-rules
+  "Every hard rule `cattleops.governor` can emit. The build fails unless
+  the run actually exercised all of them -- this makes the page's
+  HARD-hold claims a build-time invariant rather than a convention."
+  #{:facility-not-registered :no-execution :treatment-or-slaughter-blocked
+    :op-not-allowed :herd-count-invalid})
+
+(defn invariants
+  "Claims the page makes, each paired with what the run measured.
+  `-main` throws unless every one holds."
+  [{:keys [runs matrix ledger store] :as state}]
+  (let [all (concat runs matrix)
+        holds (filter #(= :hold (disposition-of %)) all)
+        gov-holds (filter #(seq (get-in % [:result :verdict :violations])) all)
+        commits (filter #(= :commit (disposition-of %)) all)
+        escalations (filter #(= :escalate (disposition-of %)) all)
+        rules (fired-rules state)
+        phases (into (sorted-set) (map :phase all))
+        hard-but-committed (filter #(and (get-in % [:result :verdict :hard?])
+                                         (= :commit (disposition-of %)))
+                                   all)
+        hard-with-record (filter #(and (get-in % [:result :verdict :hard?])
+                                       (get-in % [:result :record]))
+                                 all)
+        registered-ok? (every? #(some? (store/registered-facility store %))
+                               (sort (keys seed-facilities)))]
+    [{:id :hard-holds-exist
+      :claim "実行が Governor のハード違反を少なくとも 1 件生成する"
+      :expected ">= 1"
+      :measured (count gov-holds)
+      :ok? (pos? (count gov-holds))}
+     {:id :all-hard-rules-fired
+      :claim "Governor が出しうるハード rule 5 種すべてが実際に発火する"
+      :expected (str/join ", " (map name (sort required-hard-rules)))
+      :measured (str/join ", " (map name rules))
+      :ok? (every? rules required-hard-rules)}
+     {:id :holds-recorded
+      :claim "hold した実行はすべて :governor-hold 監査事実を残す"
+      :expected (count holds)
+      :measured (count (filter hold-fact-of holds))
+      :ok? (= (count holds) (count (filter hold-fact-of holds)))}
+     {:id :hard-never-commits
+      :claim "ハード違反のある提案は 1 件もコミットしない"
+      :expected 0
+      :measured (count hard-but-committed)
+      :ok? (zero? (count hard-but-committed))}
+     {:id :hard-writes-no-record
+      :claim "ハード違反のある提案はコミット記録を一切生成しない"
+      :expected 0
+      :measured (count hard-with-record)
+      :ok? (zero? (count hard-with-record))}
+     {:id :commits-exist
+      :claim "clean な提案は実際にコミットまで到達する"
+      :expected ">= 1"
+      :measured (count commits)
+      :ok? (pos? (count commits))}
+     {:id :escalations-exist
+      :claim "人間へのエスカレーション経路が実際に踏まれる"
+      :expected ">= 1"
+      :measured (count escalations)
+      :ok? (pos? (count escalations))}
+     {:id :all-phases-exercised
+      :claim "rollout phase 0-3 をすべて実行する"
+      :expected "phase-0, phase-1, phase-2, phase-3"
+      :measured (str/join ", " (map name phases))
+      :ok? (every? phases [:phase-0 :phase-1 :phase-2 :phase-3])}
+     {:id :probe-facility-unregistered
+      :claim (str "probe id " unregistered-facility-id " は store に存在しない")
+      :expected "nil"
+      :measured (pr-str (store/registered-facility store unregistered-facility-id))
+      :ok? (nil? (store/registered-facility store unregistered-facility-id))}
+     {:id :seed-facilities-registered
+      :claim "seed した施設はすべて store から引ける"
+      :expected (str/join ", " (sort (keys seed-facilities)))
+      :measured (str/join ", " (sort (keep #(:id (store/registered-facility store %))
+                                           (sort (keys seed-facilities)))))
+      :ok? registered-ok?}
+     {:id :ledger-complete
+      :claim "監査台帳は 1 実行あたり 2 事実 (提案 + 処分) を持つ"
+      :expected (* 2 (count all))
+      :measured (count ledger)
+      :ok? (= (count ledger) (* 2 (count all)))}]))
+
+(defn- invariant-section [state]
+  {:title "ビルド不変条件 (このページが満たしていること)"
+   :lead (str "これらは "
+              (code "cattleops.render-html/-main")
+              " が実行後に検査し、1 つでも崩れればビルドを "
+              (code "throw")
+              " で落とす。ページ上の主張は慣習ではなくビルド時の不変条件である。")
+   :headers ["不変条件" "期待" "実測" "判定"]
+   :rows (for [{:keys [claim expected measured ok?]} (invariants state)]
+           [(esc claim)
+            (code expected)
+            (code measured)
+            (if ok? (span "ok" "OK") (span "critical" "FAIL"))])})
+
+;; ------------------------------ render ------------------------------
+
+(defn- sections [state]
+  [(facilities-section state)
+   (op-gate-section state)
+   (species-section state)
+   (cost-threshold-section state)
+   (scenario-section state)
+   (hard-hold-section state)
+   (phase-matrix-section state)
+   (approval-section state)
+   (ledger-section state)
+   (invariant-section state)])
+
+(defn render
+  "Renders the whole console from a completed `run-demo!` state."
+  [state]
+  (let [secs (sections state)]
+    (str
+     "<!DOCTYPE html>\n"
+     "<html lang=\"ja\"><head><meta charset=\"utf-8\">"
+     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+     "<title>cloud-itonami-isic-0141 &middot; cattle-raising operations</title><style>"
+     (jp-go-dds.skin/dds+skin)
+     "</style></head><body>\n"
+     "<header class=\"bar\">\n"
+     "  <h1>肉用牛・乳用牛・水牛の飼養 (ISIC 0141) — オペレーターコンソール</h1>\n"
+     "  <span class=\"badge\">read-only sample · governor-gated · 直接治療と と畜/淘汰は恒久ブロック · 動物の健康懸念は常に人間へ</span>\n"
+     "</header>\n"
+     "<main>\n"
+     "  <section class=\"card\">\n"
+     "    <h2>このページについて</h2>\n"
+     "    <p>このコンソールは <code>clojure -M:dev:render-html</code> がビルド時に生成する。"
+     "本文の数値・id・判定理由はすべて実アクター "
+     "(<code>cattleops.operation</code> → <code>cattleops.advisor</code> → 独立した "
+     "<code>cattleops.governor</code> → <code>cattleops.phase</code>) を実際に走らせた戻り値であり、"
+     "手書きのサンプルは含まない。タイムスタンプ・乱数を含まないため再生成はバイト単位で同一になる。</p>\n"
+     "    <p class=\"muted\">この actor は back-office の調整専用である。動物への直接処置、"
+     "獣医療の実施、と畜/淘汰の判断は牧場主と獣医の専権事項であり、Governor が構造的に排除する — "
+     "advisor の確信度では覆せない。</p>\n"
+     "  </section>\n"
+     (str/join "" (map section secs))
+     "</main>\n"
+     "<footer>\n"
+     "  <p class=\"muted\">cloud-itonami-isic-0141 · AGPL-3.0-or-later · "
+     "生成元: <code>src/cattleops/render_html.clj</code></p>\n"
+     "</footer>\n"
+     "</body></html>\n")))
+
+(defn -main [& args]
+  (let [out (or (first args) "docs/samples/operator-console.html")
+        state (run-demo!)
+        checks (invariants state)
+        failed (remove :ok? checks)]
+    (when (seq failed)
+      (throw (ex-info "operator console build invariants failed -- refusing to write a page whose claims the run did not produce"
+                      {:failed (mapv #(select-keys % [:id :claim :expected :measured]) failed)})))
+    (let [html (render state)
+          rules (fired-rules state)
+          missing-on-page (remove #(str/includes? html (name %)) rules)]
+      ;; The page must actually SHOW what the run produced -- a silent
+      ;; rendering bug would otherwise pass every invariant above.
+      (when (seq missing-on-page)
+        (throw (ex-info "rendered page omits hard rules the run actually fired"
+                        {:missing (mapv name missing-on-page)})))
+      (io/make-parents out)
+      (spit out html :encoding "UTF-8")
+      (println "wrote" out
+               (str "(" (count (:runs state)) " scenarios, "
+                    (count (:matrix state)) " phase-matrix runs, "
+                    (count (:ledger state)) " audit facts, "
+                    (count rules) " hard rules fired: "
+                    (str/join "," (map name rules)) ", "
+                    (count checks) " invariants OK)")))))
