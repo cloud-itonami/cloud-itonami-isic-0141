@@ -29,12 +29,12 @@
   assert anything this repo's own data does not contain):
     - facility ids/names   `farm-001`/\"Test Ranch\" from `cattleops.sim`,
                            `farm-002`/\"New Ranch\" from
-                           `test/cattleops/store_test.cljc`
+                           `test/cattleops/store_test.cljk`
     - species ids          `cattle`/`buffalo` from `cattleops.facts/species`
     - supply categories    `feed`/`equipment` and the 500/1000 thresholds
                            from `cattleops.facts/supply-categories`
     - costs                100 / 500 / 800 / 1000 / 1200 -- all from
-                           `test/cattleops/governor_test.cljc` or the
+                           `test/cattleops/governor_test.cljk` or the
                            thresholds themselves (500 is the exact
                            boundary; `registry/cost-exceeds-threshold?`
                            is inclusive there)
@@ -772,7 +772,7 @@
      "</main>\n"
      "<footer>\n"
      "  <p class=\"muted\">cloud-itonami-isic-0141 · AGPL-3.0-or-later · "
-     "生成元: <code>src/cattleops/render_html.clj</code></p>\n"
+     "生成元: <code>src/cattleops/render_html.cljk</code></p>\n"
      "</footer>\n"
      "</body></html>\n")))
 
