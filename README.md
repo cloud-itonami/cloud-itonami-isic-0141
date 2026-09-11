@@ -13,7 +13,7 @@ over decisions.
 `RanchingOperationsGovernor` (`cattleops.governor`), composed by
 `cattleops.operation` following the itonami actor pattern (ADR-2607011000):
 `advise -> govern -> phase-gate -> commit | escalate | hold`. 30 tests /
-90 assertions green (`clojure -M:test`).
+90 assertions green (`kbb -M:test`).
 
 `cattleops.operation` is a synchronous stub of this flow (see its
 docstring) — production wiring into a `langgraph-clj` StateGraph with
@@ -110,7 +110,7 @@ Mirrors `cloud-itonami-isic-1010` (`meatprocessing.*`) module-for-module:
 - `cattleops.governor` — `RanchingOperationsGovernor`: hard invariants + escalation gates
 - `cattleops.phase` — 0→3 rollout phase gate
 - `cattleops.operation` — composes advisor → governor → phase into one operation run
-- `cattleops.sim` — demo runner (`clojure -M:run`)
+- `cattleops.sim` — demo runner (`kbb -M:run`)
 
 ## Capability layer
 
@@ -128,9 +128,9 @@ See [`docs/business-model.md`](docs/business-model.md) and
 ## Testing
 
 ```bash
-clojure -M:test   # 30 tests / 90 assertions
-clojure -M:lint   # clj-kondo, 0 errors / 0 warnings
-clojure -M:run    # demo runner
+kbb -M:test   # 30 tests / 90 assertions
+kbb -M:lint   # clj-kondo, 0 errors / 0 warnings
+kbb -M:run    # demo runner
 ```
 
 ## License
