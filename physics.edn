@@ -1,0 +1,41 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:dev:physics` runs it.
+;;
+;; README "Robotics premise": a facility-management robot keeps herd records,
+;; schedules appointments and handles supplies for a cattle and buffalo farm
+;; (ISIC 0141). Its physical work in the barn: driving the feed wagon down the
+;; feed alley, draining the bulk milk tank to the collection tanker, and
+;; pumping drinking water to the troughs.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-0141"
+ :cases
+ [{:id :feed-wagon-down-feed-alley
+   :kind :transport
+   :procedure "autonomous feed wagon carries a mixed ration load from the feed kitchen down the barn's feed alley"
+   :params {:mass-kg 900.0 :distance-m 100.0 :v-max-mps 1.0 :a-max-mps2 0.4
+            :brake-decel-mps2 1.0 :drive-force-n 1500.0 :crr 0.03
+            :cog-height-m 0.90 :support-half-length-m 0.80 :max-time-s 3600.0}
+   :sweep {:param :payload-kg :values [300.0 600.0 900.0 1200.0 1500.0]}
+   :quantity :cycle-time-s
+   :limit {:max 110.0 :basis "estimate: one alley leg inside the feeding round's per-pen time"}
+   :boundary {:lo 100.0 :hi 5000.0}}
+  {:id :bulk-milk-tank-to-tanker
+   :kind :tank-drain
+   :procedure "robot opens the outlet valve and the 3,500-litre bulk milk tank drains to the collection tanker's intake"
+   :params {:tank-area-m2 2.5 :h0-m 1.4 :h-target-m 0.03 :cd 0.62 :dt-s 0.5 :max-time-s 86400.0}
+   :sweep {:param :orifice-area-m2 :values [0.00126 0.00196 0.00332 0.00503 0.00785]}
+   :quantity :time-to-target-s
+   :limit {:max 900.0 :basis "estimate: tanker stop of about 15 minutes per farm (gravity only; a real pickup pumps)"}
+   :boundary {:lo 0.0005 :hi 0.02}}
+  {:id :trough-supply-line
+   :kind :pipe-flow
+   :procedure "pump supplies drinking water through the 250 m polyethylene line to the barn's water troughs"
+   :params {:diameter-m 0.032 :length-m 250.0 :roughness-m 1.5e-6
+            :density-kg-m3 998.0 :viscosity-pa-s 1.0e-3 :pump-efficiency 0.50 :elevation-m 4.0}
+   :sweep {:param :q-m3s :values [0.0005 0.0010 0.0015 0.0020 0.0030]}
+   :quantity :pump-power-w
+   :limit {:max 750.0 :basis "estimate: rated shaft power of a 0.75 kW farm water pump"}
+   :boundary {:lo 0.0001 :hi 0.006}}]}
